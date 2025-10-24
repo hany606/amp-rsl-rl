@@ -66,11 +66,18 @@ class ActorMoE(nn.Module):
         gate_hidden_dims: list[int] | None = None,
         activation="elu",
         orthogonal_experts: bool = False,
+        use_magnitude_head: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_experts = num_experts
+        self.use_orthogonal = orthogonal_experts
+        self.use_magnitude_head = use_magnitude_head and orthogonal_experts
+        if self.use_orthogonal:
+            print("Using orthogonal experts in ActorMoE.")
+        if self.use_magnitude_head:
+            print("Using magnitude head in ActorMoE.")
         act = resolve_nn_activation(activation)
 
         # experts
@@ -78,7 +85,6 @@ class ActorMoE(nn.Module):
             [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
         )
 
-        self.use_orthogonal = orthogonal_experts
         self.orthogonal_layer = OrthogonalLayer() if self.use_orthogonal else nn.Identity()
 
         # gating network
@@ -92,12 +98,14 @@ class ActorMoE(nn.Module):
         self.gate = nn.Sequential(*gate_layers)
         self.softmax = nn.Softmax(dim=-1)  # kept separate for ONNX clarity
 
-        self.magnitude_head = nn.Sequential(
-            nn.Linear(obs_dim, 64),
-            resolve_nn_activation(activation),
-            nn.Linear(64, self.act_dim),
-            nn.Softplus() 
-        )
+        
+        if self.use_magnitude_head:
+            self.magnitude_head = nn.Sequential(
+                nn.Linear(obs_dim, 64),
+                resolve_nn_activation(activation),
+                nn.Linear(64, self.act_dim),
+                nn.Softplus() 
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -107,13 +115,13 @@ class ActorMoE(nn.Module):
             mean action: [batch, act_dim]
         """
         expert_out = torch.stack([e(x) for e in self.experts], dim=-1) # [B, D, K]
-        ortho_experts = self.orthogonal_layer(expert_out)
+        expert_out = self.orthogonal_layer(expert_out)
         gate_logits = self.gate(x)  # [batch, K]
         weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
         # The weighted sum is a convex combination of orthonormal vectors.
-        actions = (ortho_experts * weights).sum(-1)  # weighted sum -> [batch, A]
+        actions = (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]
         
-        if self.use_orthogonal:
+        if self.use_magnitude_head:
             magnitude = self.magnitude_head(x) # [B, A]
             actions = actions * magnitude
             
@@ -138,6 +146,7 @@ class ActorCriticMoE(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         orthogonal_experts: bool = False,
+        use_magnitude_head: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -159,6 +168,7 @@ class ActorCriticMoE(nn.Module):
             gate_hidden_dims=actor_hidden_dims[:-1],  # last layer is output
             activation=activation,
             orthogonal_experts=orthogonal_experts,
+            use_magnitude_head=use_magnitude_head,
         )
 
         # Critic
