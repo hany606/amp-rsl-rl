@@ -16,6 +16,41 @@ class MLP_net(nn.Sequential):
                 layers.extend([nn.Linear(hidden_dims[i], hidden_dims[i + 1]), act])
         super().__init__(*layers)
 
+class OrthogonalLayer(nn.Module):
+    """
+    Adapted from https://github.com/AhmedMagdyHendawy/MOORE/
+    Orthogonalizes expert outputs along the expert dimension using a vectorized
+    Gram–Schmidt (batched) procedure.
+
+    Input:  x [B, D, E]  (batch, feature_dim, num_experts)
+    Output: basis [B, D, E]  (orthonormal across E for each batch item)
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = x.transpose(1, 2)  # [B, E, D]
+        B, E, D = x1.shape
+
+        eps = torch.finfo(x1.dtype).eps if x1.is_floating_point() else 1e-8
+
+        # First basis vector (normalize)
+        b0 = x1[:, 0, :]  # [B, D]
+        b0 = b0 / b0.norm(dim=1, keepdim=True).clamp_min(eps)
+        basis = b0.unsqueeze(1)  # [B, 1, D]
+
+        # Subsequent vectors: v - Proj_{span(basis)}(v) in one batched matmul
+        for i in range(1, E):
+            v = x1[:, i, :].unsqueeze(1)  # [B, 1, D]
+            # projection: [B,1,D] @ [B,D,i] -> [B,1,i] ; then @ [B,i,D] -> [B,1,D]
+            proj = v @ basis.transpose(2, 1) @ basis
+            w = v - proj
+            w = w / w.norm(dim=2, keepdim=True).clamp_min(eps)  # normalize
+            basis = torch.cat([basis, w], dim=1)  # [B, i+1, D]
+
+        # Return to [B, D, E]
+        return basis.transpose(1, 2)  # [B, D, E]
+
 
 class ActorMoE(nn.Module):
     """
@@ -30,6 +65,7 @@ class ActorMoE(nn.Module):
         num_experts: int = 4,
         gate_hidden_dims: list[int] | None = None,
         activation="elu",
+        orthogonal_experts: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -42,6 +78,9 @@ class ActorMoE(nn.Module):
             [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
         )
 
+        self.use_orthogonal = orthogonal_experts
+        self.orthogonal_layer = OrthogonalLayer() if self.use_orthogonal else nn.Identity()
+
         # gating network
         gate_layers = []
         last_dim = obs_dim
@@ -53,6 +92,13 @@ class ActorMoE(nn.Module):
         self.gate = nn.Sequential(*gate_layers)
         self.softmax = nn.Softmax(dim=-1)  # kept separate for ONNX clarity
 
+        self.magnitude_head = nn.Sequential(
+            nn.Linear(obs_dim, 64),
+            resolve_nn_activation(activation),
+            nn.Linear(64, self.act_dim),
+            nn.Softplus() 
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -60,10 +106,19 @@ class ActorMoE(nn.Module):
         Returns:
             mean action: [batch, act_dim]
         """
-        expert_out = torch.stack([e(x) for e in self.experts], dim=-1)
+        expert_out = torch.stack([e(x) for e in self.experts], dim=-1) # [B, D, K]
+        ortho_experts = self.orthogonal_layer(expert_out)
         gate_logits = self.gate(x)  # [batch, K]
         weights = self.softmax(gate_logits).unsqueeze(1)  # [batch, 1, K]
-        return (expert_out * weights).sum(-1)  # weighted sum -> [batch, A]
+        # The weighted sum is a convex combination of orthonormal vectors.
+        actions = (ortho_experts * weights).sum(-1)  # weighted sum -> [batch, A]
+        
+        if self.use_orthogonal:
+            magnitude = self.magnitude_head(x) # [B, A]
+            actions = actions * magnitude
+            
+        return actions
+
 
 
 class ActorCriticMoE(nn.Module):
@@ -82,6 +137,7 @@ class ActorCriticMoE(nn.Module):
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
+        orthogonal_experts: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -102,6 +158,7 @@ class ActorCriticMoE(nn.Module):
             num_experts=num_experts,
             gate_hidden_dims=actor_hidden_dims[:-1],  # last layer is output
             activation=activation,
+            orthogonal_experts=orthogonal_experts,
         )
 
         # Critic
