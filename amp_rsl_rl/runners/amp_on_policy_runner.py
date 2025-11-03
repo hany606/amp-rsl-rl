@@ -10,6 +10,7 @@ import os
 import statistics
 import time
 from collections import deque
+import itertools
 
 import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
@@ -23,9 +24,47 @@ from rsl_rl.utils import store_code_state
 from amp_rsl_rl.utils import Normalizer
 from amp_rsl_rl.utils import AMPLoader
 from amp_rsl_rl.algorithms import AMP_PPO
-from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
+from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, DiscriminatorMoE, ActorCriticGeneral
 from amp_rsl_rl.utils import export_policy_as_onnx
 
+def debug(msg="debug", interrupt=True, postmortem=False, pdb=False):
+    if interrupt:
+        # import pdb
+        import pudb
+        import os
+        os.environ["PYTHONBREAKPOINT"] = "pudb.set_trace"
+
+
+        spaces = min(len(msg) + 4, 30)
+        print(f'{"#"*spaces}')
+        # print(f"#{' '*(spaces//2)}debug{' '*(spaces//2)}#")
+        print(f"# {msg} #")
+        print(f'{"#"*spaces}')
+        # print(f'{"#"*(spaces+5)}')
+        # not working for now
+        # if postmortem:
+        #     import traceback
+        #     pudb.post_mortem()
+        # else:
+        if pdb:
+            pdb.set_trace()
+        else:
+            breakpoint()
+            
+def get_obs_indicies(env):
+    obs_manager = env.unwrapped.observation_manager
+    names = obs_manager.active_terms # e.g., {'policy':['velocity_tracking', 'base_contact'], 'critic':['velocity_tracking', 'base_contact']}
+    dims = obs_manager.group_obs_term_dim # e.g., {'policy': [12, 1], 'critic': [12, 1]}
+    indices = {}
+    for obs_name in names.keys():
+        indices[obs_name] = {}
+        for i, key in enumerate(names[obs_name]):
+            # produce the running sum offsets (start at 0). Using accumulate
+            # is clearer and more efficient than repeatedly summing slices.
+            # indices[obs_name][key] = [0] + list(itertools.accumulate(dims[obs_name][i]))
+            indices[obs_name][key] = [sum(dims[obs_name][:i]) for i in range(len(dims[obs_name]))]
+
+    return indices
 
 class AMPOnPolicyRunner:
     """
@@ -141,7 +180,8 @@ class AMPOnPolicyRunner:
         else:
             num_critic_obs = num_obs
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
+        # debug()
+        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE | ActorCriticGeneral = (
             actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
@@ -167,7 +207,8 @@ class AMPOnPolicyRunner:
 
         # amp_data = AMPLoader(num_amp_obs, self.device)
         self.amp_normalizer = Normalizer(num_amp_obs, device=self.device)
-        self.discriminator = Discriminator(
+        disc_class = eval(self.discriminator_cfg.pop("class_name"))  # AMP_PPO
+        self.discriminator: Discriminator | DiscriminatorMoE = disc_class(
             input_dim=num_amp_obs* 2,  # the discriminator takes in the concatenation of the current and next observation
             hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
             reward_scale=self.discriminator_cfg["reward_scale"],
@@ -223,6 +264,11 @@ class AMPOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+        self.task_reward_weight = self.cfg['task_reward_weight'] #self.cfg.get('task_reward_weight', 0.5)
+        self.style_reward_weight = self.cfg['style_reward_weight'] #self.cfg.get('style_reward_weight', 0.5)
+        print(f"[INFO] Task reward weight: {self.task_reward_weight}, Style reward weight: {self.style_reward_weight}")
+
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -350,12 +396,13 @@ class AMPOnPolicyRunner:
                     style_rewards = self.discriminator.predict_reward(
                         amp_obs, next_amp_obs, normalizer=self.amp_normalizer
                     )
-
+                    # style_rewards = torch.zeros_like(style_rewards) - 1.0  # Dummy style reward for testing
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
                     # Combine the task and style rewards (TODO this can be a hyperparameters)
-                    rewards = 0.5 * rewards + 0.5 * style_rewards
+                    rewards = self.task_reward_weight * rewards + self.style_reward_weight * style_rewards
+                    # rewards = rewards 
 
                     self.alg.process_env_step(rewards, dones, infos)
                     self.alg.process_amp_step(next_amp_obs)

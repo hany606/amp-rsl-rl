@@ -5,16 +5,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
 
-
-class MLP_net(nn.Sequential):
-    def __init__(self, in_dim, hidden_dims, out_dim, act):
-        layers = [nn.Linear(in_dim, hidden_dims[0]), act]
-        for i in range(len(hidden_dims)):
-            if i == len(hidden_dims) - 1:
-                layers.append(nn.Linear(hidden_dims[i], out_dim))
-            else:
-                layers.extend([nn.Linear(hidden_dims[i], hidden_dims[i + 1]), act])
-        super().__init__(*layers)
+from .networks import MLP_net, IdentityPreprocessor
 
 class OrthogonalLayer(nn.Module):
     """
@@ -51,7 +42,6 @@ class OrthogonalLayer(nn.Module):
         # Return to [B, D, E]
         return basis.transpose(1, 2)  # [B, D, E]
 
-
 class ActorMoE(nn.Module):
     """
     Mixture-of-Experts actor:  ⎡expert_1(x) … expert_K(x)⎤·softmax(gate(x))
@@ -62,6 +52,7 @@ class ActorMoE(nn.Module):
         obs_dim: int,
         act_dim: int,
         hidden_dims,
+        preprocessor: nn.Module = IdentityPreprocessor(),
         num_experts: int = 4,
         gate_hidden_dims: list[int] | None = None,
         activation="elu",
@@ -79,7 +70,7 @@ class ActorMoE(nn.Module):
         if self.use_magnitude_head:
             print("Using magnitude head in ActorMoE.")
         act = resolve_nn_activation(activation)
-
+        self.preprocessor = preprocessor
         # experts
         self.experts = nn.ModuleList(
             [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
@@ -107,6 +98,9 @@ class ActorMoE(nn.Module):
                 nn.Softplus() 
             )
 
+    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        return self.preprocessor(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -114,6 +108,7 @@ class ActorMoE(nn.Module):
         Returns:
             mean action: [batch, act_dim]
         """
+        x = self._preprocess(x)
         expert_out = torch.stack([e(x) for e in self.experts], dim=-1) # [B, D, K]
         expert_out = self.orthogonal_layer(expert_out)
         gate_logits = self.gate(x)  # [batch, K]
@@ -126,8 +121,6 @@ class ActorMoE(nn.Module):
             actions = actions * magnitude
             
         return actions
-
-
 
 class ActorCriticMoE(nn.Module):
     """Actor-critic with Mixture-of-Experts policy."""
@@ -152,7 +145,7 @@ class ActorCriticMoE(nn.Module):
         if kwargs:
             print(
                 (
-                    "ActorCriticMoE.__init__ ignored unexpected arguments: "
+                    "ActorCriticGeneral.__init__ ignored unexpected arguments: "
                     + str(list(kwargs.keys()))
                 )
             )
