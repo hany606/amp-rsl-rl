@@ -8,7 +8,6 @@ import torch.nn as nn
 from torch import autograd
 from rsl_rl.utils import utils
 
-
 class Discriminator(nn.Module):
     """Discriminator implements the discriminator network for the AMP algorithm.
 
@@ -38,15 +37,9 @@ class Discriminator(nn.Module):
         self.input_dim = input_dim
         self.reward_scale = reward_scale
         self.reward_clamp_epsilon = reward_clamp_epsilon
-        layers = []
-        curr_in_dim = input_dim
-
-        for hidden_dim in hidden_layer_sizes:
-            layers.append(nn.Linear(curr_in_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            curr_in_dim = hidden_dim
-
-        self.trunk = nn.Sequential(*layers).to(device)
+        
+        # Build the trunk and head networks
+        self.trunk = self._build_trunk(input_dim, hidden_layer_sizes).to(device)
         self.linear = nn.Linear(hidden_layer_sizes[-1], 1).to(device)
 
         self.trunk.train()
@@ -62,6 +55,17 @@ class Discriminator(nn.Module):
             raise ValueError(
                 f"Unsupported loss type: {self.loss_type}. Supported types are 'BCEWithLogits' and 'Wasserstein'."
             )
+
+    def _build_trunk(self, input_dim: int, hidden_layer_sizes: list[int]) -> nn.Sequential:
+        layers = []
+        curr_in_dim = input_dim
+
+        for hidden_dim in hidden_layer_sizes:
+            layers.append(nn.Linear(curr_in_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            curr_in_dim = hidden_dim
+
+        return nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the discriminator.
